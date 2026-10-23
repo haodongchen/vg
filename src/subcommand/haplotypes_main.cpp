@@ -36,10 +36,14 @@ namespace haplotypes_defaults {
 
 constexpr size_t DEFAULT_MAX_THREADS = 16;
 
+// Returns the number of processors this process can run on. Unlike
+// omp_get_max_threads(), this ignores OMP_NUM_THREADS.
+size_t processors() {
+    return std::max(omp_get_num_procs(), 1);
+}
+
 size_t threads() {
-    size_t threads = omp_get_max_threads();
-    threads = std::max(threads, size_t(1));
-    return std::min(threads, DEFAULT_MAX_THREADS);
+    return std::min(processors(), DEFAULT_MAX_THREADS);
 }
 
 constexpr size_t k() {
@@ -151,7 +155,7 @@ void density_statistics(const gbwtgraph::GBZ& gbz, const Haplotypes& haplotypes,
 int main_haplotypes(int argc, char** argv) {
     double start = gbwt::readTimer();
     gbwt::Verbosity::set(gbwt::Verbosity::SILENT);
-    size_t max_threads = omp_get_max_threads();
+    size_t max_threads = haplotypes_defaults::processors();
     omp_set_num_threads(haplotypes_defaults::threads());
 
     // Parse the arguments.
@@ -539,8 +543,8 @@ HaplotypesConfig::HaplotypesConfig(int argc, char** argv, size_t max_threads) {
             }
             break;
         case 't':
-            // The OpenMP maximum is already lowered to the default, so we
-            // pass the original maximum for this system.
+            // The thread count is capped at the number of processors, not at
+            // the current OpenMP maximum, which is the default thread count.
             this->threads = set_thread_count(logger, optarg, max_threads);
             break;
 
