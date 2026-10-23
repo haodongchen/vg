@@ -6,6 +6,7 @@
  */
 
 #include <deque>
+#include <memory>
 #include <mutex>
 
 #include <kff_io.hpp>
@@ -77,7 +78,14 @@ inline gbwtgraph::Key64::value_type minimizer_reverse_complement(gbwtgraph::Key6
 //------------------------------------------------------------------------------
 
 /**
- * A wrapper over `Kff_reader` that allows reading kmers safely from multiple threads.
+ * A reader for the kmers and counts in a KFF file that can be used safely from
+ * multiple threads.
+ *
+ * The reader goes through the sections of the file in order. Only one thread
+ * reads the file at a time. Raw sections with one kmer per block, which KMC
+ * writes, consist of fixed-size records. The reader reads many of them at once
+ * and decodes them after releasing the file to other threads. Other sections
+ * are read block by block.
  */
 class ParallelKFFReader {
 public:
@@ -87,19 +95,10 @@ public:
     /// file cannot be opened or the data is unacceptable.
     ParallelKFFReader(const std::string& filename);
 
-    /// Reads the next `n` kmers and counts from the file. This can be called safely
-    /// from multiple threads. If the returned vector contains fewer than `n` kmers
-    /// this indicates that the reader has reached the end of the file.
+    /// Reads up to `n` next kmers and their counts from the file. This can be
+    /// called safely from multiple threads. Returns an empty vector when there
+    /// are no more kmers in the file.
     std::vector<std::pair<kmer_type, size_t>> read(size_t n);
-
-    /// KFF reader.
-    Kff_reader reader;
-
-    /// Buffer from unused kmers from the latest block.
-    std::deque<std::pair<kmer_type, size_t>> buffer;
-
-    /// Mutex for accessing `reader` and `buffer`.
-    std::mutex mtx;
 
     /// Length of the kmers.
     size_t k;
@@ -119,6 +118,33 @@ public:
 private:
     ParallelKFFReader(const ParallelKFFReader&) = delete;
     ParallelKFFReader& operator= (const ParallelKFFReader&) = delete;
+
+    // Moves to the next section that has blocks left. Reads the variable and
+    // index sections on the way, which updates the variables of the file.
+    // Returns false at the end of the file.
+    bool find_blocks();
+
+    // Reads blocks from the current section, decodes their kmers, and appends
+    // them to `result` until it has at least `n` kmers or the section ends.
+    // Kmers in the last block that do not fit go to `buffer`.
+    void read_blocks(size_t n, std::vector<std::pair<kmer_type, size_t>>& result);
+
+    // Decodes fixed-size records, each a kmer of length `kmer_length` followed
+    // by its count in `count_bytes` bytes, and appends them to `result`.
+    void decode_records(const std::vector<std::uint8_t>& records, size_t kmer_length, size_t count_bytes,
+                        std::vector<std::pair<kmer_type, size_t>>& result) const;
+
+    // The file being read.
+    std::unique_ptr<Kff_file> file;
+
+    // The section with blocks being read, or null.
+    std::unique_ptr<Block_section_reader> section;
+
+    // Kmers from the latest block that did not fit in the latest `read()`.
+    std::deque<std::pair<kmer_type, size_t>> buffer;
+
+    // Mutex for accessing `file`, `section`, and `buffer`.
+    std::mutex mtx;
 };
 
 //------------------------------------------------------------------------------

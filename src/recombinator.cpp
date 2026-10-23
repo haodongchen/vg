@@ -8,8 +8,11 @@
 #include "algorithms/extract_subchain.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
 #include <cmath>
 #include <map>
+#include <unordered_map>
 
 //#define debug_selected_haplotypes
 
@@ -53,15 +56,104 @@ bool is_gref_fragment(const gbwtgraph::GBWTGraph& graph, path_handle_t path) {
 
 //------------------------------------------------------------------------------
 
-hash_map<Haplotypes::Subchain::kmer_type, size_t>::iterator
-find_kmer(hash_map<Haplotypes::Subchain::kmer_type, size_t>& counts, Haplotypes::Subchain::kmer_type kmer, size_t k) {
-    Haplotypes::Subchain::kmer_type rc = minimizer_reverse_complement(kmer, k);
-    auto forward = counts.find(kmer);
-    auto reverse = counts.find(rc);
-    return (forward != counts.end() ? forward : reverse);
+KmerCountTable::KmerCountTable(size_t k, size_t max_kmers) :
+    k(k),
+    // At least a third of the cells stay empty, which keeps the searches short.
+    kmers(max_kmers + max_kmers / 2 + 1, EMPTY),
+    counts(this->kmers.size(), 0)
+{
 }
 
-hash_map<Haplotypes::Subchain::kmer_type, size_t> Haplotypes::kmer_counts(const std::string& kff_file, Verbosity verbosity) const {
+size_t KmerCountTable::first_cell(kmer_type kmer) const {
+    // The kmers are minimizers, chosen for having small Wang hashes, so their
+    // Wang hashes would crowd the start of the table. We hash them with the
+    // unrelated SplitMix64 finalizer instead.
+    std::uint64_t hash = kmer;
+    hash = (hash ^ (hash >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    hash = (hash ^ (hash >> 27)) * 0x94D049BB133111EBULL;
+    hash = hash ^ (hash >> 31);
+
+    // Map the hash to [0, cells) without division.
+    unsigned __int128 product = static_cast<unsigned __int128>(hash) * this->kmers.size();
+    return static_cast<size_t>(product >> 64);
+}
+
+size_t KmerCountTable::find(kmer_type kmer, size_t cell) const {
+    while (this->kmers[cell] != kmer) {
+        if (this->kmers[cell] == EMPTY) {
+            return this->kmers.size();
+        }
+        cell++;
+        if (cell == this->kmers.size()) {
+            cell = 0;
+        }
+    }
+    return cell;
+}
+
+bool KmerCountTable::insert(kmer_type kmer) {
+    for (size_t cell = this->first_cell(kmer); ; cell = (cell + 1 == this->kmers.size() ? 0 : cell + 1)) {
+        std::atomic_ref<kmer_type> cell_kmer(this->kmers[cell]);
+        kmer_type found = cell_kmer.load(std::memory_order_relaxed);
+        // If another thread fills the cell first, the exchange fails and sets
+        // `found` to the kmer it inserted.
+        if (found == EMPTY && cell_kmer.compare_exchange_strong(found, kmer, std::memory_order_relaxed)) {
+            return true;
+        }
+        if (found == kmer) {
+            return false;
+        }
+    }
+}
+
+void KmerCountTable::add_counts(const std::vector<std::pair<kmer_type, size_t>>& counts) {
+    // We look up the kmers in batches. For each batch, we prefetch the first
+    // cells of all searches before doing any of them, so that the memory
+    // accesses overlap.
+    constexpr size_t BATCH_SIZE = 16;
+    kmer_type reverse_kmers[BATCH_SIZE];
+    size_t forward_cells[BATCH_SIZE], reverse_cells[BATCH_SIZE];
+    for (size_t batch_start = 0; batch_start < counts.size(); batch_start += BATCH_SIZE) {
+        size_t batch_size = std::min(BATCH_SIZE, counts.size() - batch_start);
+        for (size_t i = 0; i < batch_size; i++) {
+            kmer_type kmer = counts[batch_start + i].first;
+            reverse_kmers[i] = minimizer_reverse_complement(kmer, this->k);
+            forward_cells[i] = this->first_cell(kmer);
+            reverse_cells[i] = this->first_cell(reverse_kmers[i]);
+            __builtin_prefetch(this->kmers.data() + forward_cells[i]);
+            __builtin_prefetch(this->kmers.data() + reverse_cells[i]);
+        }
+        for (size_t i = 0; i < batch_size; i++) {
+            size_t cell = this->find(counts[batch_start + i].first, forward_cells[i]);
+            if (cell == this->kmers.size()) {
+                cell = this->find(reverse_kmers[i], reverse_cells[i]);
+            }
+            if (cell < this->kmers.size()) {
+                std::atomic_ref<size_t>(this->counts[cell]).fetch_add(counts[batch_start + i].second, std::memory_order_relaxed);
+            }
+        }
+    }
+}
+
+size_t KmerCountTable::count(kmer_type kmer) const {
+    size_t cell = this->find(kmer, this->first_cell(kmer));
+    if (cell == this->kmers.size()) {
+        throw std::out_of_range("KmerCountTable::count(): the kmer is not in the table");
+    }
+    return this->counts[cell];
+}
+
+void KmerCountTable::for_each_count(const std::function<void(size_t)>& f) const {
+    for (size_t cell = 0; cell < this->kmers.size(); cell++) {
+        if (this->kmers[cell] != EMPTY) {
+            f(this->counts[cell]);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+
+KmerCountTable Haplotypes::kmer_counts(const std::string& kff_file, Verbosity verbosity) const {
     double start = gbwt::readTimer();
     if (verbosity >= verbosity_basic) {
         std::cerr << "Reading kmer counts" << std::endl;
@@ -70,51 +162,41 @@ hash_map<Haplotypes::Subchain::kmer_type, size_t> Haplotypes::kmer_counts(const 
     // Open and validate the kmer count file.
     ParallelKFFReader reader(kff_file);
 
-    // Populate the map with the kmers we are interested in.
+    // Populate the table with the kmers we are interested in.
     double checkpoint = gbwt::readTimer();
-    hash_map<Subchain::kmer_type, size_t> result;
-    result.reserve(this->header.total_kmers);
-    for (size_t chain_id = 0; chain_id < this->chains.size(); chain_id++) {
-        const TopLevelChain& chain = this->chains[chain_id];
-        for (size_t subchain_id = 0; subchain_id < chain.subchains.size(); subchain_id++) {
-            const Subchain& subchain = chain.subchains[subchain_id];
-            for (size_t kmer_id = 0; kmer_id < subchain.kmers.size(); kmer_id++) {
-                result[subchain.kmers[kmer_id]] = 0;
-            }
+    std::vector<const Subchain*> subchains;
+    size_t max_kmers = 0;
+    for (const TopLevelChain& chain : this->chains) {
+        for (const Subchain& subchain : chain.subchains) {
+            subchains.push_back(&subchain);
+            max_kmers += subchain.kmers.size();
+        }
+    }
+    KmerCountTable result(this->k(), max_kmers);
+    size_t distinct_kmers = 0;
+    #pragma omp parallel for schedule(dynamic, 1) reduction(+:distinct_kmers)
+    for (size_t i = 0; i < subchains.size(); i++) {
+        for (Subchain::kmer_type kmer : subchains[i]->kmers) {
+            distinct_kmers += result.insert(kmer);
         }
     }
     if (verbosity >= verbosity_detailed) {
         double seconds = gbwt::readTimer() - checkpoint;
-        std::cerr << "Initialized the hash map with " << result.size() << " kmers in " << seconds << " seconds" << std::endl;
+        std::cerr << "Initialized the hash table with " << distinct_kmers << " kmers in " << seconds << " seconds" << std::endl;
     }
 
     // Read the KFF file and add the counts using multiple threads.
     checkpoint = gbwt::readTimer();
     size_t kmer_count = 0;
-    #pragma omp parallel
+    #pragma omp parallel reduction(+:kmer_count)
     {
-        #pragma omp task
-        {
-            while (true) {
-                std::vector<std::pair<ParallelKFFReader::kmer_type, size_t>> block = reader.read(Recombinator::KFF_BLOCK_SIZE);
-                if (block.empty()) {
-                    break;
-                }
-                std::vector<std::pair<hash_map<Subchain::kmer_type, size_t>::iterator, size_t>> buffer;
-                for (auto kmer : block) {
-                    auto iter = find_kmer(result, kmer.first, this->k());
-                    if (iter != result.end()) {
-                        buffer.push_back({ iter, kmer.second });
-                    }
-                }
-                #pragma omp critical
-                {
-                    for (auto to_update : buffer) {
-                        to_update.first->second += to_update.second;
-                    }
-                    kmer_count += block.size();
-                }
+        while (true) {
+            std::vector<std::pair<ParallelKFFReader::kmer_type, size_t>> block = reader.read(Recombinator::KFF_BLOCK_SIZE);
+            if (block.empty()) {
+                break;
             }
+            result.add_counts(block);
+            kmer_count += block.size();
         }
     }
     if (verbosity >= verbosity_detailed) {
@@ -1756,7 +1838,7 @@ void validate_recombinator_parameters(const Recombinator::Parameters& parameters
 }
 
 double get_or_estimate_coverage(
-    const hash_map<Haplotypes::Subchain::kmer_type, size_t>& counts,
+    const KmerCountTable& counts,
     const Recombinator::Parameters& parameters,
     Haplotypes::Verbosity verbosity) {
     if (parameters.coverage > 0) {
@@ -1767,12 +1849,23 @@ double get_or_estimate_coverage(
     if (verbosity >= Haplotypes::verbosity_basic) {
         std::cerr << "Estimating kmer coverage" << std::endl;
     }
+    // We count the frequencies of small counts in an array first, because
+    // updating the map for every kmer is slow.
+    constexpr size_t ARRAY_LIMIT = 65536;
+    std::vector<size_t> array_frequencies(ARRAY_LIMIT, 0);
     std::map<size_t, size_t> count_to_frequency;
-    for (auto iter = counts.begin(); iter != counts.end(); ++iter) {
+    counts.for_each_count([&](size_t count) {
         // We are only interested in kmers with multiple occurrences, as unique
         // kmers are likely sequencing errors.
-        if (iter->second > 1) {
-            count_to_frequency[iter->second]++;
+        if (count > 1 && count < ARRAY_LIMIT) {
+            array_frequencies[count]++;
+        } else if (count > 1) {
+            count_to_frequency[count]++;
+        }
+    });
+    for (size_t count = 2; count < ARRAY_LIMIT; count++) {
+        if (array_frequencies[count] > 0) {
+            count_to_frequency[count] = array_frequencies[count];
         }
     }
 
@@ -1829,7 +1922,27 @@ double get_or_estimate_coverage(
     return coverage;
 }
 
+// Returns a vector marking the GBWT paths that belong to banned samples, or an
+// empty vector if no samples are banned.
+std::vector<bool> find_banned_paths(const gbwt::Metadata& metadata, const std::unordered_set<std::string>& banned_samples) {
+    std::vector<bool> result;
+    if (banned_samples.empty()) {
+        return result;
+    }
+    result.resize(metadata.paths());
+    for (size_t path_id = 0; path_id < metadata.paths(); path_id++) {
+        result[path_id] = (banned_samples.find(metadata.fullPath(path_id).sample_name) != banned_samples.end());
+    }
+    return result;
+}
+
 gbwt::GBWT Recombinator::generate_haplotypes(const std::string& kff_file, const Parameters& parameters) const {
+    // Validate the parameters before reading the kmer counts (may throw).
+    validate_recombinator_parameters(parameters);
+    return this->generate_haplotypes(this->haplotypes.kmer_counts(kff_file, this->verbosity), parameters);
+}
+
+gbwt::GBWT Recombinator::generate_haplotypes(KmerCountTable&& kmer_counts, const Parameters& parameters) const {
 
     // Input validation (may throw).
     validate_recombinator_parameters(parameters);
@@ -1838,9 +1951,8 @@ gbwt::GBWT Recombinator::generate_haplotypes(const std::string& kff_file, const 
         parameters.print(std::cerr);
     }
 
-    // Get kmer counts (may throw) and determine coverage.
-    hash_map<Haplotypes::Subchain::kmer_type, size_t> counts = this->haplotypes.kmer_counts(kff_file, this->verbosity);
-    double coverage = get_or_estimate_coverage(counts, parameters, this->verbosity);
+    // Determine coverage.
+    double coverage = get_or_estimate_coverage(kmer_counts, parameters, this->verbosity);
 
     double start = gbwt::readTimer();
     if (this->verbosity >= Haplotypes::verbosity_basic) {
@@ -1884,10 +1996,49 @@ gbwt::GBWT Recombinator::generate_haplotypes(const std::string& kff_file, const 
         }
     }
 
+    // Choose the parameters for each chain we personalize. Excluded chains are
+    // copied through verbatim instead, which takes precedence over the scoring
+    // models. High- and half-coverage chains use their own scoring model, no
+    // diploid sampling, and their own haplotype count.
+    Parameters high_coverage_parameters = parameters;
+    high_coverage_parameters.scoring_model = Parameters::high_coverage_scoring;
+    high_coverage_parameters.diploid_sampling = false;
+    high_coverage_parameters.num_haplotypes = parameters.high_coverage_num_haplotypes;
+    Parameters half_coverage_parameters = parameters;
+    half_coverage_parameters.scoring_model = Parameters::half_coverage_scoring;
+    half_coverage_parameters.diploid_sampling = false;
+    half_coverage_parameters.num_haplotypes = parameters.half_coverage_num_haplotypes;
+    std::vector<const Parameters*> chain_parameters(this->haplotypes.components(), nullptr);
+    for (const std::vector<size_t>& job : jobs) {
+        for (size_t chain_id : job) {
+            if (parameters.excluded_chains.find(chain_id) != parameters.excluded_chains.end()) {
+                continue;
+            }
+            if (parameters.high_coverage_chains.find(chain_id) != parameters.high_coverage_chains.end()) {
+                chain_parameters[chain_id] = &high_coverage_parameters;
+            } else if (parameters.half_coverage_chains.find(chain_id) != parameters.half_coverage_chains.end()) {
+                chain_parameters[chain_id] = &half_coverage_parameters;
+            } else {
+                chain_parameters[chain_id] = &parameters;
+            }
+        }
+    }
+
+    // Select the sequences for all subchains before building the GBWT. Then
+    // free the kmer counts, which the construction jobs do not need.
+    double checkpoint = gbwt::readTimer();
+    std::vector<bool> banned_paths = find_banned_paths(this->gbz.index.metadata, parameters.banned_samples);
+    std::vector<std::vector<SubchainSelection>> selections = this->select_sequences(chain_parameters, kmer_counts, coverage, banned_paths);
+    kmer_counts = KmerCountTable(this->haplotypes.k(), 0);
+    if (this->verbosity >= Haplotypes::verbosity_basic) {
+        double seconds = gbwt::readTimer() - checkpoint;
+        std::cerr << "Selected the haplotypes in " << seconds << " seconds" << std::endl;
+    }
+
     // Build partial indexes.
     // We use a separate MetadataBuilder for each job, because we don't know in advance
     // how many fragments there will be for each generated haplotype.
-    double checkpoint = gbwt::readTimer();
+    checkpoint = gbwt::readTimer();
     if (this->verbosity >= Haplotypes::verbosity_basic) {
         std::cerr << "Running " << omp_get_max_threads() << " GBWT construction jobs in parallel" << std::endl;
     }
@@ -1907,33 +2058,16 @@ gbwt::GBWT Recombinator::generate_haplotypes(const std::string& kff_file, const 
         for (auto chain_id : jobs[job]) {
             try {
                 Statistics chain_statistics;
-                if (parameters.excluded_chains.find(chain_id) != parameters.excluded_chains.end()) {
-                    // Excluded chains are copied through verbatim instead of
-                    // personalizing them. This takes precedence over the scoring
-                    // models.
+                if (chain_parameters[chain_id] == nullptr) {
+                    // The chain is excluded, so we copy it through verbatim
+                    // instead of personalizing it.
                     chain_statistics = this->copy_chain(
                         this->haplotypes.chains[chain_id], builder, metadata
                     );
                 } else {
-                    // High- and half-coverage chains use their own scoring model,
-                    // no diploid sampling, and their own haplotype count.
-                    const Parameters* chain_parameters = &parameters;
-                    Parameters chain_parameters_override;
-                    if (parameters.high_coverage_chains.find(chain_id) != parameters.high_coverage_chains.end()) {
-                        chain_parameters_override = parameters;
-                        chain_parameters_override.scoring_model = Parameters::high_coverage_scoring;
-                        chain_parameters_override.diploid_sampling = false;
-                        chain_parameters_override.num_haplotypes = parameters.high_coverage_num_haplotypes;
-                        chain_parameters = &chain_parameters_override;
-                    } else if (parameters.half_coverage_chains.find(chain_id) != parameters.half_coverage_chains.end()) {
-                        chain_parameters_override = parameters;
-                        chain_parameters_override.scoring_model = Parameters::half_coverage_scoring;
-                        chain_parameters_override.diploid_sampling = false;
-                        chain_parameters_override.num_haplotypes = parameters.half_coverage_num_haplotypes;
-                        chain_parameters = &chain_parameters_override;
-                    }
                     chain_statistics = this->generate_haplotypes(
-                        this->haplotypes.chains[chain_id], counts, builder, metadata, *chain_parameters, coverage
+                        this->haplotypes.chains[chain_id], std::move(selections[chain_id]),
+                        builder, metadata, *chain_parameters[chain_id]
                     );
                 }
                 job_statistics.combine(chain_statistics);
@@ -1995,7 +2129,7 @@ gbwt::GBWT Recombinator::generate_haplotypes(const std::string& kff_file, const 
 // statistics with the number of non-frequent kmers if necessary.
 std::vector<std::pair<Recombinator::kmer_presence, double>> classify_kmers(
     const Haplotypes::Subchain& subchain,
-    const hash_map<Haplotypes::Subchain::kmer_type, size_t>& kmer_counts,
+    const KmerCountTable& kmer_counts,
     double coverage,
     Recombinator::Statistics* statistics,
     const Recombinator::Parameters& parameters
@@ -2011,7 +2145,7 @@ std::vector<std::pair<Recombinator::kmer_presence, double>> classify_kmers(
     std::vector<std::pair<Recombinator::kmer_presence, double>> kmer_types;
     size_t selected_kmers = 0;
     for (size_t kmer_id = 0; kmer_id < subchain.kmers.size(); kmer_id++) {
-        double count = kmer_counts.at(subchain.kmers[kmer_id]);
+        double count = kmer_counts.count(subchain.kmers[kmer_id]);
         switch (parameters.scoring_model) {
         case Recombinator::Parameters::high_coverage_scoring:
             // High-coverage model: the frequent component is the true signal,
@@ -2068,6 +2202,148 @@ std::vector<std::pair<Recombinator::kmer_presence, double>> classify_kmers(
 
 //------------------------------------------------------------------------------
 
+/*
+ * A table of the distinct kmer sets of the sequences in a subchain.
+ *
+ * Each sequence maps to a row, and sequences that contain the same kmers share
+ * a row. Sequences in the same row get the same score, so the table scores
+ * each row once.
+ *
+ * The rows are stored in groups of 8. For each kmer, a group has a byte with
+ * bit `row % 8` set if the row contains the kmer. The bytes of a group are
+ * stored in kmer order. When scoring, the table reads one byte for each kmer
+ * and adds a term for the kmer to 8 sums at once.
+ */
+class KmerSetTable {
+public:
+    /// Builds the table for the sequences in the subchain.
+    explicit KmerSetTable(const Haplotypes::Subchain& subchain);
+
+    /// Returns the row of the sequence at the given offset in the subchain.
+    size_t row_of(size_t sequence) const { return this->sequence_rows[sequence]; }
+
+    /// Scores each row with the given kmer scores. A row gets +score for each
+    /// kmer it contains and -score for each kmer it lacks.
+    ///
+    /// We add the terms in kmer order, starting from 0.0. Hence the score of a
+    /// row is bit-identical to the same sum over the kmers of one of its
+    /// sequences. We skip terms of 0.0. A sum that starts from +0.0 never
+    /// becomes -0.0, and adding +0.0 or -0.0 to any other value leaves it
+    /// unchanged.
+    std::vector<double> score_rows(const std::vector<std::pair<Recombinator::kmer_presence, double>>& kmer_types) const;
+
+private:
+    constexpr static size_t ROWS_PER_GROUP = 8;
+
+    // Number of kmers in the subchain.
+    size_t kmers;
+
+    // Number of distinct kmer sets.
+    size_t rows;
+
+    // The row of each sequence.
+    std::vector<size_t> sequence_rows;
+
+    // Byte `group * kmers + kmer` marks the rows in the group that contain the kmer.
+    std::vector<std::uint8_t> groups;
+
+    // A table of sign masks for the bytes of a group. For each byte and each
+    // row of the group, the mask is the sign bit of a double if the row lacks
+    // the kmer, and 0 if the row contains it. XORing a kmer score with the
+    // mask gives the term for the row.
+    struct SignTable {
+        SignTable();
+        std::uint64_t signs[256][ROWS_PER_GROUP];
+    };
+    static const SignTable SIGN_TABLE;
+};
+
+const KmerSetTable::SignTable KmerSetTable::SIGN_TABLE;
+
+KmerSetTable::SignTable::SignTable() {
+    for (size_t byte = 0; byte < 256; byte++) {
+        for (size_t row = 0; row < ROWS_PER_GROUP; row++) {
+            this->signs[byte][row] = ((byte >> row) & 1 ? 0 : std::uint64_t(1) << 63);
+        }
+    }
+}
+
+KmerSetTable::KmerSetTable(const Haplotypes::Subchain& subchain) :
+    kmers(subchain.kmers.size()), rows(0), sequence_rows(subchain.sequences.size())
+{
+    // Find the distinct kmer sets. We store them as 64-bit words and find
+    // identical sets by hashing the words.
+    size_t words = (this->kmers + 63) / 64;
+    std::vector<std::uint64_t> kmer_sets;
+    std::unordered_multimap<std::uint64_t, size_t> rows_by_hash;
+    std::vector<std::uint64_t> kmer_set(words);
+    for (size_t sequence = 0; sequence < subchain.sequences.size(); sequence++) {
+        std::uint64_t hash = 0;
+        for (size_t word = 0; word < words; word++) {
+            size_t offset = sequence * this->kmers + 64 * word;
+            kmer_set[word] = subchain.kmers_present.get_int(offset, std::min<size_t>(64, this->kmers - 64 * word));
+            hash = wang_hash_64(hash ^ kmer_set[word]);
+        }
+        size_t row = this->rows;
+        auto range = rows_by_hash.equal_range(hash);
+        for (auto iter = range.first; iter != range.second; ++iter) {
+            if (std::equal(kmer_set.begin(), kmer_set.end(), kmer_sets.begin() + iter->second * words)) {
+                row = iter->second;
+                break;
+            }
+        }
+        if (row == this->rows) {
+            rows_by_hash.emplace(hash, row);
+            kmer_sets.insert(kmer_sets.end(), kmer_set.begin(), kmer_set.end());
+            this->rows++;
+        }
+        this->sequence_rows[sequence] = row;
+    }
+
+    // Store the rows in groups.
+    size_t group_count = (this->rows + ROWS_PER_GROUP - 1) / ROWS_PER_GROUP;
+    this->groups = std::vector<std::uint8_t>(group_count * this->kmers, 0);
+    for (size_t row = 0; row < this->rows; row++) {
+        std::uint8_t* group = this->groups.data() + (row / ROWS_PER_GROUP) * this->kmers;
+        std::uint8_t row_bit = std::uint8_t(1) << (row % ROWS_PER_GROUP);
+        for (size_t word = 0; word < words; word++) {
+            for (std::uint64_t value = kmer_sets[row * words + word]; value != 0; value &= value - 1) {
+                group[64 * word + sdsl::bits::lo(value)] |= row_bit;
+            }
+        }
+    }
+}
+
+std::vector<double> KmerSetTable::score_rows(const std::vector<std::pair<Recombinator::kmer_presence, double>>& kmer_types) const {
+    std::vector<size_t> scored_kmers;
+    std::vector<std::uint64_t> kmer_scores; // As the bits of a double.
+    for (size_t kmer_id = 0; kmer_id < this->kmers; kmer_id++) {
+        if (kmer_types[kmer_id].second != 0.0) {
+            scored_kmers.push_back(kmer_id);
+            kmer_scores.push_back(std::bit_cast<std::uint64_t>(kmer_types[kmer_id].second));
+        }
+    }
+
+    // We negate a kmer score by flipping its sign bit, as unary minus does.
+    size_t group_count = (this->rows + ROWS_PER_GROUP - 1) / ROWS_PER_GROUP;
+    std::vector<double> result(group_count * ROWS_PER_GROUP, 0.0);
+    for (size_t group = 0; group < group_count; group++) {
+        const std::uint8_t* group_bytes = this->groups.data() + group * this->kmers;
+        double sums[ROWS_PER_GROUP] = {};
+        for (size_t i = 0; i < scored_kmers.size(); i++) {
+            const std::uint64_t* signs = SIGN_TABLE.signs[group_bytes[scored_kmers[i]]];
+            for (size_t row = 0; row < ROWS_PER_GROUP; row++) {
+                sums[row] += std::bit_cast<double>(kmer_scores[i] ^ signs[row]);
+            }
+        }
+        std::copy(sums, sums + ROWS_PER_GROUP, result.begin() + group * ROWS_PER_GROUP);
+    }
+    result.resize(this->rows);
+    return result;
+}
+
+//------------------------------------------------------------------------------
+
 // Select the best pair of haplotypes from the candidates. Each haplotype gets
 // +1 for getting a kmer right and -1 for getting it wrong.
 // Also returns the remaining non-duplicated haplotypes as extra fragments if
@@ -2079,6 +2355,51 @@ std::vector<std::pair<size_t, double>> select_diploid(
     const std::vector<std::pair<Recombinator::kmer_presence, double>>& kmer_types,
     const Recombinator::Parameters& parameters
 ) {
+    // A pair of haplotypes scores each kmer by the number of haplotypes that
+    // contain it:
+    // * absent: +1 for 0, 0 for 1, -1 for 2;
+    // * heterozygous: +1 for 1, 0 otherwise;
+    // * present: -1 for 0, 0 for 1, +1 for 2.
+    // The sum over the kmers splits into a constant, a score for each
+    // haplotype, and a score for the pair. The constant is the number of
+    // absent kmers minus the number of present kmers. A haplotype gets +1 for
+    // each present kmer and -1 for each absent kmer it contains. The pair gets
+    // +1 for each heterozygous kmer in exactly one of the haplotypes. We count
+    // the kmers 64 at a time with words of kmer sets.
+    size_t kmers = subchain.kmers.size();
+    size_t words = (kmers + 63) / 64;
+    std::vector<std::uint64_t> absent_kmers(words, 0), heterozygous_kmers(words, 0), present_kmers(words, 0);
+    std::int64_t constant_score = 0;
+    for (size_t kmer_id = 0; kmer_id < kmers; kmer_id++) {
+        std::uint64_t bit = std::uint64_t(1) << (kmer_id % 64);
+        switch (kmer_types[kmer_id].first) {
+        case Recombinator::absent:
+            absent_kmers[kmer_id / 64] |= bit;
+            constant_score++;
+            break;
+        case Recombinator::heterozygous:
+            heterozygous_kmers[kmer_id / 64] |= bit;
+            break;
+        case Recombinator::present:
+            present_kmers[kmer_id / 64] |= bit;
+            constant_score--;
+            break;
+        default:
+            break;
+        }
+    }
+    std::vector<std::uint64_t> kmer_sets(candidates.size() * words);
+    std::vector<std::int64_t> haplotype_scores(candidates.size(), 0);
+    for (size_t candidate = 0; candidate < candidates.size(); candidate++) {
+        size_t offset = candidates[candidate].first * kmers;
+        for (size_t word = 0; word < words; word++) {
+            std::uint64_t kmer_set = subchain.kmers_present.get_int(offset + 64 * word, std::min<size_t>(64, kmers - 64 * word));
+            kmer_sets[candidate * words + word] = kmer_set;
+            haplotype_scores[candidate] += sdsl::bits::cnt(kmer_set & present_kmers[word]);
+            haplotype_scores[candidate] -= sdsl::bits::cnt(kmer_set & absent_kmers[word]);
+        }
+    }
+
     std::int64_t best_score = std::numeric_limits<std::int64_t>::min();
     size_t best_left = 0, best_right = 0;
 
@@ -2086,25 +2407,12 @@ std::vector<std::pair<size_t, double>> select_diploid(
     // and we sample extra fragments, the number of fragments will depend on
     // whether we take the same haplotype twice.
     for (size_t left = 0; left < candidates.size(); left++) {
-        size_t left_offset = candidates[left].first * subchain.kmers.size();
+        const std::uint64_t* left_kmers = kmer_sets.data() + left * words;
         for (size_t right = left; right < candidates.size(); right++) {
-            std::int64_t score = 0;
-            size_t right_offset = candidates[right].first * subchain.kmers.size();
-            for (size_t kmer_id = 0; kmer_id < subchain.kmers.size(); kmer_id++) {
-                int64_t found = subchain.kmers_present[left_offset + kmer_id] + subchain.kmers_present[right_offset + kmer_id];
-                switch (kmer_types[kmer_id].first) {
-                case Recombinator::absent:
-                    score += 1 - found; // +1 for 0, 0 for 1, -1 for 2
-                    break;
-                case Recombinator::heterozygous:
-                    score += (found == 1 ? 1 : 0);
-                    break;
-                case Recombinator::present:
-                    score += found - 1; // -1 for 0, 0 for 1, +1 for 2
-                    break;
-                default:
-                    break;
-                }
+            const std::uint64_t* right_kmers = kmer_sets.data() + right * words;
+            std::int64_t score = constant_score + haplotype_scores[left] + haplotype_scores[right];
+            for (size_t word = 0; word < words; word++) {
+                score += sdsl::bits::cnt((left_kmers[word] ^ right_kmers[word]) & heterozygous_kmers[word]);
             }
             if (score > best_score) {
                 best_score = score;
@@ -2136,44 +2444,39 @@ std::vector<std::pair<size_t, double>> select_diploid(
 }
 
 // Returns (sequence offset in the subchain, score).
+// Does not select sequences of the GBWT paths marked in `banned_paths`. An
+// empty vector marks no paths.
 // Updates statistics with the number of kmers used if provided.
 // Updates the local haplotypes with scores and ranks in each round of selection
 // if provided.
 std::vector<std::pair<size_t, double>> select_haplotypes(
     const gbwtgraph::GBZ& gbz,
     const Haplotypes::Subchain& subchain,
-    const hash_map<Haplotypes::Subchain::kmer_type, size_t>& kmer_counts,
+    const KmerCountTable& kmer_counts,
     double coverage,
+    const std::vector<bool>& banned_paths,
     Recombinator::Statistics* statistics,
     std::vector<Recombinator::LocalHaplotype>* local_haplotypes,
     const Recombinator::Parameters& parameters
 ) {
     // Classify the kmers.
     std::vector<std::pair<Recombinator::kmer_presence, double>> kmer_types = classify_kmers(subchain, kmer_counts, coverage, statistics, parameters);
+    KmerSetTable kmer_sets(subchain);
 
     // Select the haplotypes greedily.
     std::vector<std::pair<size_t, double>> selected_haplotypes;
     std::vector<std::pair<size_t, double>> remaining_haplotypes;
     for (size_t seq_offset = 0; seq_offset < subchain.sequences.size(); seq_offset++) {
-        // Metadata to make sure this haplotype isn't among the banned
-        gbwt::size_type sequence_id = subchain.sequences[seq_offset].first;
-        gbwt::size_type path_id = gbwt::Path::id(sequence_id);
-        gbwt::FullPathName path_name = gbz.index.metadata.fullPath(path_id);
-
-        if (parameters.banned_samples.find(path_name.sample_name) == parameters.banned_samples.end()) {
+        gbwt::size_type path_id = gbwt::Path::id(subchain.sequences[seq_offset].first);
+        if (banned_paths.empty() || !banned_paths[path_id]) {
             remaining_haplotypes.push_back( { seq_offset, 0.0 });
         }
     }
     while (selected_haplotypes.size() < parameters.num_haplotypes && !remaining_haplotypes.empty()) {
         // Score the remaining haplotypes.
+        std::vector<double> row_scores = kmer_sets.score_rows(kmer_types);
         for (size_t i = 0; i < remaining_haplotypes.size(); i++) {
-            size_t offset = remaining_haplotypes[i].first * subchain.kmers.size();
-            double score = 0.0;
-            for (size_t kmer_id = 0; kmer_id < subchain.kmers.size(); kmer_id++) {
-                double multiplier = -1.0 + 2.0 * subchain.kmers_present[offset + kmer_id];
-                score += multiplier * kmer_types[kmer_id].second;
-            }
-            remaining_haplotypes[i].second = score;
+            remaining_haplotypes[i].second = row_scores[kmer_sets.row_of(remaining_haplotypes[i].first)];
         }
 
         // Report ranks and scores for each remaining haplotype.
@@ -2235,11 +2538,47 @@ std::vector<std::pair<size_t, double>> select_haplotypes(
     }
 }
 
+std::vector<std::vector<Recombinator::SubchainSelection>> Recombinator::select_sequences(
+    const std::vector<const Parameters*>& chain_parameters,
+    const KmerCountTable& kmer_counts,
+    double coverage, const std::vector<bool>& banned_paths
+) const {
+    // List the subchains to select in as (chain id, subchain id).
+    std::vector<std::vector<SubchainSelection>> result(this->haplotypes.components());
+    std::vector<std::pair<size_t, size_t>> subchains;
+    for (size_t chain_id = 0; chain_id < this->haplotypes.components(); chain_id++) {
+        if (chain_parameters[chain_id] == nullptr) {
+            continue;
+        }
+        const Haplotypes::TopLevelChain& chain = this->haplotypes.chains[chain_id];
+        result[chain_id].resize(chain.subchains.size());
+        for (size_t subchain_id = 0; subchain_id < chain.subchains.size(); subchain_id++) {
+            const Haplotypes::Subchain& subchain = chain.subchains[subchain_id];
+            if (subchain.type != Haplotypes::Subchain::full_haplotype && !subchain.sequences.empty()) {
+                subchains.emplace_back(chain_id, subchain_id);
+            }
+        }
+    }
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (size_t i = 0; i < subchains.size(); i++) {
+        auto [chain_id, subchain_id] = subchains[i];
+        Statistics statistics;
+        SubchainSelection& selection = result[chain_id][subchain_id];
+        selection.sequences = select_haplotypes(
+            this->gbz, this->haplotypes.chains[chain_id].subchains[subchain_id], kmer_counts, coverage,
+            banned_paths, &statistics, nullptr, *chain_parameters[chain_id]
+        );
+        selection.kmers = statistics.kmers;
+    }
+
+    return result;
+}
+
 Recombinator::Statistics Recombinator::generate_haplotypes(const Haplotypes::TopLevelChain& chain,
-    const hash_map<Haplotypes::Subchain::kmer_type, size_t>& kmer_counts,
+    std::vector<SubchainSelection>&& selections,
     gbwt::GBWTBuilder& builder, gbwtgraph::MetadataBuilder& metadata,
-    const Parameters& parameters,
-    double coverage
+    const Parameters& parameters
 ) const {
     size_t final_haplotypes = (parameters.diploid_sampling ? 2 : parameters.num_haplotypes);
     bool wrap = (parameters.wrap_contigs.find(chain.contig_name) != parameters.wrap_contigs.end());
@@ -2270,11 +2609,10 @@ Recombinator::Statistics Recombinator::generate_haplotypes(const Haplotypes::Top
             }
             assert(!subchain.sequences.empty());
 
-            // Select the haplotypes greedily. If we are doing diploid sampling and we get
+            // Take the selected haplotypes. If we are doing diploid sampling and we got
             // extra fragments, store them for later processing.
-            std::vector<std::pair<size_t, double>> selected_haplotypes = select_haplotypes(
-                this->gbz, subchain, kmer_counts, coverage, &statistics, nullptr, parameters
-            );
+            std::vector<std::pair<size_t, double>> selected_haplotypes = std::move(selections[subchain_id].sequences);
+            statistics.kmers += selections[subchain_id].kmers;
 #ifdef debug_selected_haplotypes
             for (size_t i = 0; i < selected_haplotypes.size(); i++) {
                 gbwt::size_type sequence_id = subchain.sequences[selected_haplotypes[i].first].first;

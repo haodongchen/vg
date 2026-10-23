@@ -15,6 +15,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <thread>
 #include <vector>
 #include <unordered_map>
@@ -133,9 +134,13 @@ struct HaplotypesConfig {
 
 void preprocess_graph(const gbwtgraph::GBZ& gbz, Haplotypes& haplotypes, HaplotypesConfig& config);
 
+void load_sampling_inputs(gbwtgraph::GBZ& gbz, Haplotypes& haplotypes, std::optional<KmerCountTable>& kmer_counts,
+                          const HaplotypesConfig& config);
+
 void set_reference_samples(gbwtgraph::GBZ& gbz, const HaplotypesConfig& config);
 
-void sample_haplotypes(const gbwtgraph::GBZ& gbz, const Haplotypes& haplotypes, const HaplotypesConfig& config);
+void sample_haplotypes(const gbwtgraph::GBZ& gbz, const Haplotypes& haplotypes, std::optional<KmerCountTable>&& kmer_counts,
+                       const HaplotypesConfig& config);
 
 void subchain_statistics(const gbwtgraph::GBZ& gbz, const Haplotypes& haplotypes, const HaplotypesConfig& config);
 
@@ -152,21 +157,26 @@ int main_haplotypes(int argc, char** argv) {
     // Parse the arguments.
     HaplotypesConfig config(argc, argv, max_threads);
 
-    // Load the graph.
     gbwtgraph::GBZ gbz;
-    load_gbz(gbz, config.graph_name, config.verbosity >= Haplotypes::verbosity_basic);
-
-    // Generate or load haplotype information.
     Haplotypes haplotypes;
-    if (config.mode == HaplotypesConfig::mode_sample_graph || config.mode == HaplotypesConfig::mode_preprocess) {
-        preprocess_graph(gbz, haplotypes, config);
+    std::optional<KmerCountTable> kmer_counts;
+    if (config.mode == HaplotypesConfig::mode_sample_haplotypes) {
+        load_sampling_inputs(gbz, haplotypes, kmer_counts, config);
     } else {
-        if (config.verbosity >= Haplotypes::verbosity_basic) {
-            config.logger.info() << "Loading haplotype information from " 
-                                 << config.haplotype_input << std::endl;
+        // Load the graph.
+        load_gbz(gbz, config.graph_name, config.verbosity >= Haplotypes::verbosity_basic);
+
+        // Generate or load haplotype information.
+        if (config.mode == HaplotypesConfig::mode_sample_graph || config.mode == HaplotypesConfig::mode_preprocess) {
+            preprocess_graph(gbz, haplotypes, config);
+        } else {
+            if (config.verbosity >= Haplotypes::verbosity_basic) {
+                config.logger.info() << "Loading haplotype information from " 
+                                     << config.haplotype_input << std::endl;
+            }
+            haplotypes.load_from(config.haplotype_input);
+            require_compatible_graphs(gbz, "GBZ", haplotypes, "Haplotype Information");
         }
-        haplotypes.load_from(config.haplotype_input);
-        require_compatible_graphs(gbz, "GBZ", haplotypes, "Haplotype Information");
     }
 
     // Save haplotype information if necessary.
@@ -183,7 +193,7 @@ int main_haplotypes(int argc, char** argv) {
         if (!config.reference_samples.empty()) {
             set_reference_samples(gbz, config);
         }
-        sample_haplotypes(gbz, haplotypes, config);
+        sample_haplotypes(gbz, haplotypes, std::move(kmer_counts), config);
     }
 
     // Output statistics on subchain lengths and kmer counts.
@@ -721,7 +731,63 @@ void validate_subgraph(const Logger& logger, const gbwtgraph::GBWTGraph& graph,
 std::unordered_set<size_t> resolve_chains_by_name(const gbwtgraph::GBZ& gbz, const Haplotypes& haplotypes,
                                                   const std::vector<std::string>& names, const Logger& logger);
 
-void sample_haplotypes(const gbwtgraph::GBZ& gbz, const Haplotypes& haplotypes, const HaplotypesConfig& config) {
+// Loads the haplotype information and counts the kmers in the KFF file. Uses
+// `threads_to_jobs()` OpenMP threads, like sampling. Returns an error message,
+// or an empty string on success. It returns instead of exiting on errors,
+// because exiting is unsafe while another thread runs.
+std::string load_haplotypes_and_count_kmers(Haplotypes& haplotypes, std::optional<KmerCountTable>& kmer_counts,
+                                            const HaplotypesConfig& config) {
+    omp_set_num_threads(threads_to_jobs(config.threads));
+    if (config.verbosity >= Haplotypes::verbosity_basic) {
+        config.logger.info() << "Loading haplotype information from " << config.haplotype_input << std::endl;
+    }
+    try {
+        sdsl::simple_sds::load_from(haplotypes, config.haplotype_input);
+    } catch (const std::runtime_error& e) {
+        return "cannot load haplotype information from " + config.haplotype_input + ": " + e.what();
+    }
+    try {
+        kmer_counts = haplotypes.kmer_counts(config.kmer_input, config.verbosity);
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    return "";
+}
+
+// Loads the graph, the haplotype information, and the kmer counts for sampling.
+// Exits with an error message if any of them cannot be loaded.
+void load_sampling_inputs(gbwtgraph::GBZ& gbz, Haplotypes& haplotypes, std::optional<KmerCountTable>& kmer_counts,
+                          const HaplotypesConfig& config) {
+    // The haplotype information and the kmer counts do not depend on the
+    // graph, so another thread gets them while we load the graph.
+    std::string reader_error;
+    std::thread reader([&]() {
+        reader_error = load_haplotypes_and_count_kmers(haplotypes, kmer_counts, config);
+    });
+
+    // We report errors once the reader has finished, because exiting while
+    // another thread runs is unsafe.
+    if (config.verbosity >= Haplotypes::verbosity_basic) {
+        config.logger.info() << "Loading GBZ from " << config.graph_name << std::endl;
+    }
+    std::string gbz_error;
+    try {
+        sdsl::simple_sds::load_from(gbz, config.graph_name);
+    } catch (const std::runtime_error& e) {
+        gbz_error = "cannot load GBZ " + config.graph_name + ": " + e.what();
+    }
+    reader.join();
+    if (!gbz_error.empty()) {
+        config.logger.error() << gbz_error << std::endl;
+    }
+    if (!reader_error.empty()) {
+        config.logger.error() << reader_error << std::endl;
+    }
+    require_compatible_graphs(gbz, "GBZ", haplotypes, "Haplotype Information");
+}
+
+void sample_haplotypes(const gbwtgraph::GBZ& gbz, const Haplotypes& haplotypes, std::optional<KmerCountTable>&& kmer_counts,
+                       const HaplotypesConfig& config) {
     omp_set_num_threads(threads_to_jobs(config.threads));
     Recombinator recombinator(gbz, haplotypes, config.verbosity);
 
@@ -751,7 +817,11 @@ void sample_haplotypes(const gbwtgraph::GBZ& gbz, const Haplotypes& haplotypes, 
 
     gbwt::GBWT merged;
     try {
-        merged = recombinator.generate_haplotypes(config.kmer_input, parameters);
+        if (kmer_counts) {
+            merged = recombinator.generate_haplotypes(std::move(*kmer_counts), parameters);
+        } else {
+            merged = recombinator.generate_haplotypes(config.kmer_input, parameters);
+        }
     } catch (const std::runtime_error& e) {
         config.logger.error() << e.what() << std::endl;
     }
