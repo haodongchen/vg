@@ -13,10 +13,73 @@
 
 #include <functional>
 #include <iostream>
+#include <limits>
 
 #include <gbwtgraph/algorithms.h>
 
 namespace vg {
+
+//------------------------------------------------------------------------------
+
+/**
+ * A hash table of read counts for a fixed set of kmers.
+ *
+ * The table is filled in two phases. First we insert the kmers with count 0.
+ * Then we add counts from a kmer counter. A count goes to its kmer if the kmer
+ * is in the table, or else to the reverse complement of the kmer. Counts for
+ * kmers in neither orientation are dropped. Many threads can insert kmers or
+ * add counts at the same time, but the phases must not overlap.
+ *
+ * The table uses open addressing with linear probing. The kmers and the counts
+ * are in separate arrays. Most kmers from a read set are not in the table, and
+ * a search for such a kmer usually reads one cache line of kmers.
+ */
+class KmerCountTable {
+public:
+    /// An encoded kmer.
+    typedef gbwtgraph::Key64::value_type kmer_type;
+
+    /// Creates an empty table for kmers of length `k`, with room for
+    /// `max_kmers` kmers.
+    KmerCountTable(size_t k, size_t max_kmers);
+
+    /// Inserts the kmer with count 0, unless it is already in the table.
+    /// Returns `true` if the kmer was inserted.
+    ///
+    /// @pre The table holds fewer than `max_kmers` kmers.
+    bool insert(kmer_type kmer);
+
+    /// Adds each count to its kmer, or to the reverse complement of the kmer
+    /// if the kmer is not in the table.
+    void add_counts(const std::vector<std::pair<kmer_type, size_t>>& counts);
+
+    /// Returns the count for the kmer. Throws `std::out_of_range` if the kmer
+    /// is not in the table.
+    size_t count(kmer_type kmer) const;
+
+    /// Calls `f` with the count for each kmer in the table.
+    void for_each_count(const std::function<void(size_t)>& f) const;
+
+private:
+    // The value of an empty cell. No kmer of length at most 31 has this value.
+    constexpr static kmer_type EMPTY = std::numeric_limits<kmer_type>::max();
+
+    // Returns the cell where the search for the kmer starts.
+    size_t first_cell(kmer_type kmer) const;
+
+    // Returns the cell containing the kmer, searching from the given cell.
+    // Returns the number of cells if the kmer is not in the table.
+    size_t find(kmer_type kmer, size_t cell) const;
+
+    // Length of the kmers.
+    size_t k;
+
+    // The kmer in each cell, or `EMPTY`.
+    std::vector<kmer_type> kmers;
+
+    // The count for the kmer in each cell.
+    std::vector<size_t> counts;
+};
 
 //------------------------------------------------------------------------------
 
@@ -245,14 +308,14 @@ public:
     std::vector<TopLevelChain> chains;
 
     /**
-      * Returns a mapping from kmers to their counts in the given KFF file.
-      * The counts include both the kmer and the reverse complement.
+      * Returns a table of counts in the given KFF file for the kmers in the
+      * subchains. The counts include both the kmer and the reverse complement.
       *
       * Reads the KFF file using OpenMP threads. Exits with `std::exit()` if
       * the file cannot be opened and throws `std::runtime_error` if the kmer
       * counts cannot be used.
      */
-    hash_map<Subchain::kmer_type, size_t> kmer_counts(const std::string& kff_file, Verbosity verbosity) const;
+    KmerCountTable kmer_counts(const std::string& kff_file, Verbosity verbosity) const;
 
     /// Serializes the object to a stream in the Simple-SDS format.
     /// I/O errors can be detected by checking the stream state.
@@ -678,9 +741,9 @@ public:
     /**
      * Generates haplotypes based on the kmer counts in the given KFF file.
      *
-     * Runs multiple GBWT construction jobs in parallel using OpenMP threads and
-     * generates the specified number of haplotypes in each top-level chain
-     * (component).
+     * Selects the sequences for all subchains in parallel using OpenMP threads.
+     * Then runs multiple GBWT construction jobs in parallel and generates the
+     * specified number of haplotypes in each top-level chain (component).
      *
      * Each generated haplotype has a single source haplotype in each subchain.
      * The source haplotype may consist of multiple fragments. Subchains are
@@ -693,6 +756,15 @@ public:
      * with `std::exit(EXIT_FAILURE)` in multi-threaded parts.
      */
     gbwt::GBWT generate_haplotypes(const std::string& kff_file, const Parameters& parameters) const;
+
+    /**
+     * Generates haplotypes based on the given counts for the kmers in the
+     * subchains.
+     *
+     * This lets the caller count the kmers while doing something else, such
+     * as loading the graph. Frees the counts once the haplotypes are selected.
+     */
+    gbwt::GBWT generate_haplotypes(KmerCountTable&& kmer_counts, const Parameters& parameters) const;
 
     /// A local haplotype sequence within a single subchain.
     struct LocalHaplotype {
@@ -722,11 +794,38 @@ public:
     std::vector<size_t> jobs_for_cached_paths;
 
 private:
-    // Generate haplotypes for the given chain.
+    /// A record of the sequences selected for one subchain.
+    struct SubchainSelection {
+        /// Selected sequences as (sequence offset in the subchain, score), in the
+        /// order they were selected.
+        std::vector<std::pair<size_t, double>> sequences;
+
+        /// Number of kmers used for scoring the sequences.
+        size_t kmers = 0;
+    };
+
+    // Selects the sequences for each subchain of the chains we personalize.
+    // `chain_parameters` gives the parameters for each chain by chain id, or
+    // null for a chain we do not personalize. Selection in one subchain is
+    // independent of the others, so we select in all subchains in parallel
+    // with OpenMP threads. We never select sequences of the GBWT paths marked
+    // in `banned_paths`. An empty vector marks no paths.
+    //
+    // Returns the selections by chain id and subchain id. Subchains of full
+    // haplotypes and subchains without sequences get empty selections.
+    // generate_haplotypes() handles trivial chains without selections and
+    // reports the other cases as errors.
+    std::vector<std::vector<SubchainSelection>> select_sequences(
+        const std::vector<const Parameters*>& chain_parameters,
+        const KmerCountTable& kmer_counts,
+        double coverage, const std::vector<bool>& banned_paths) const;
+
+    // Generate haplotypes for the given chain from the sequences selected for
+    // its subchains.
     Statistics generate_haplotypes(const Haplotypes::TopLevelChain& chain,
-        const hash_map<Haplotypes::Subchain::kmer_type, size_t>& kmer_counts,
+        std::vector<SubchainSelection>&& selections,
         gbwt::GBWTBuilder& builder, gbwtgraph::MetadataBuilder& metadata,
-        const Parameters& parameters, double coverage) const;
+        const Parameters& parameters) const;
 
     // Copy the given chain through verbatim, preserving the reference/generic
     // path and all haplotypes without personalization.

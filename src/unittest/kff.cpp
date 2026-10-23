@@ -8,6 +8,8 @@
 
 #include "catch.hpp"
 
+#include <algorithm>
+
 namespace vg {
 
 namespace unittest {
@@ -84,6 +86,81 @@ void recode_block(const std::string& block, const std::vector<std::string>& true
         std::string decoded = gbwtgraph::Key64(recoded[i]).decode(k);
         REQUIRE(decoded == true_kmers[i]);
     }
+}
+
+// A raw section of a KFF file.
+struct KffSection {
+    // Maximum number of kmers in a block.
+    size_t max_kmers_per_block;
+
+    // Sequence of each block.
+    std::vector<std::string> blocks;
+};
+
+// Writes raw sections of `k`-mers with the given encoding to a temporary file.
+// Each kmer gets a different count. Returns the file name and the kmers with
+// their counts in the minimizer index format.
+std::pair<std::string, std::vector<std::pair<ParallelKFFReader::kmer_type, size_t>>> write_kff(
+    const std::vector<KffSection>& sections, size_t k, const uint8_t* encoding
+) {
+    std::string filename = temp_file::create();
+    std::vector<std::pair<ParallelKFFReader::kmer_type, size_t>> kmers;
+    Kff_file file(filename, "w");
+    file.write_encoding(encoding[0], encoding[1], encoding[2], encoding[3]);
+    for (const KffSection& section : sections) {
+        Section_GV variables(&file);
+        variables.write_var("k", k);
+        variables.write_var("max", section.max_kmers_per_block);
+        variables.write_var("data_size", 1);
+        variables.close();
+
+        Section_Raw raw(&file);
+        for (const std::string& block : section.blocks) {
+            std::vector<uint8_t> counts;
+            for (size_t start = 0; start + k <= block.length(); start++) {
+                counts.push_back(kmers.size() + 1);
+                kmers.emplace_back(gbwtgraph::Key64::encode(block.substr(start, k)).get_key(), counts.back());
+            }
+            std::vector<uint8_t> encoded = kff_encode(block, encoding);
+            raw.write_compacted_sequence(encoded.data(), block.length(), counts.data());
+        }
+        raw.close();
+    }
+    file.close();
+    std::sort(kmers.begin(), kmers.end());
+    return { filename, kmers };
+}
+
+// Reads all kmers from the file, `n` at a time, using the given number of threads.
+std::vector<std::pair<ParallelKFFReader::kmer_type, size_t>> read_kff(const std::string& filename, size_t n, size_t threads) {
+    ParallelKFFReader reader(filename);
+    std::vector<std::pair<ParallelKFFReader::kmer_type, size_t>> result;
+    #pragma omp parallel num_threads(threads)
+    {
+        while (true) {
+            std::vector<std::pair<ParallelKFFReader::kmer_type, size_t>> block = reader.read(n);
+            if (block.empty()) {
+                break;
+            }
+            #pragma omp critical
+            {
+                result.insert(result.end(), block.begin(), block.end());
+            }
+        }
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+void check_kff_reader(const std::vector<KffSection>& sections, size_t k, const uint8_t* encoding) {
+    auto written = write_kff(sections, k, encoding);
+    for (size_t n : { 1, 2, 3, 100 }) {
+        for (size_t threads : { 1, 4 }) {
+            auto read = read_kff(written.first, n, threads);
+            REQUIRE(read == written.second);
+        }
+    }
+    temp_file::remove(written.first);
 }
 
 } // Anonymous namespace.
@@ -208,6 +285,33 @@ TEST_CASE("Recode blocks", "[kff]") {
             }
             recode_block(block, true_kmers, encoding);
         }
+    }
+}
+
+TEST_CASE("Parallel KFF reader", "[kff]") {
+    // Kmers of length 5 take 2 bytes, with padding in the first byte.
+    size_t k = 5;
+    KffSection single { 1, { "GATTA", "ATTAC", "TTACA", "CATTA" } };
+    KffSection multiple { 4, { "GATTACA", "CATTACAT", "ATTAC" } };
+
+    SECTION("one kmer per block, default encoding") {
+        uint8_t encoding[4] = { 0, 1, 2, 3 };
+        check_kff_reader({ single }, k, encoding);
+    }
+
+    SECTION("one kmer per block, kff encoding") {
+        uint8_t encoding[4] = { 0, 1, 3, 2 };
+        check_kff_reader({ single }, k, encoding);
+    }
+
+    SECTION("multiple kmers per block, kff encoding") {
+        uint8_t encoding[4] = { 0, 1, 3, 2 };
+        check_kff_reader({ multiple }, k, encoding);
+    }
+
+    SECTION("mixed sections, kff encoding") {
+        uint8_t encoding[4] = { 0, 1, 3, 2 };
+        check_kff_reader({ single, multiple, single }, k, encoding);
     }
 }
 
