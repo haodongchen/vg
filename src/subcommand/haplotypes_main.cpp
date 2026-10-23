@@ -529,7 +529,9 @@ HaplotypesConfig::HaplotypesConfig(int argc, char** argv, size_t max_threads) {
             }
             break;
         case 't':
-            set_thread_count(logger, optarg);
+            // The OpenMP maximum is already lowered to the default, so we
+            // pass the original maximum for this system.
+            this->threads = set_thread_count(logger, optarg, max_threads);
             break;
 
         case OPT_VALIDATE:
